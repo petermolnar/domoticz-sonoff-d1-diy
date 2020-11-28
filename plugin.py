@@ -37,16 +37,6 @@ class BasePlugin:
     def __init__(self):
         return
 
-    def query_status(self, Connection):
-        Connection.Send(
-            {
-                "Verb": "POST",
-                "URL": "/zeroconf/info",
-                "Headers": {"Content-Type": "application/json"},
-                "Data": json.dumps({"data": ""}),
-            }
-        )
-
     def onStart(self):
         if Parameters["Mode6"] != "0":
             Domoticz.Debugging(int(Parameters["Mode6"]))
@@ -61,6 +51,8 @@ class BasePlugin:
         self.httpConn.Connect()
 
     def onStop(self):
+        self.httpConn.Disconnect()
+        self.httpConn = None
         Domoticz.Log("onStop - Plugin is stopping.")
 
     def onConnect(self, Connection, Status, Description):
@@ -90,16 +82,86 @@ class BasePlugin:
             Domoticz.Error("Failed to parse response as JSON" + strData)
             return
 
-        if "data" not in strData:
-            Domoticz.Debug("`data` missing from Parsed JSON")
-            return
+        if "data" in strData and "deviceid" in strData["data"]:
+            return self.update_device(strData["data"])
 
-        data = strData["data"]
 
-        # skip these messages, they are not status updates
-        if "deviceid" not in data:
-            Domoticz.Debug("`deviceid` missing from Parsed JSON")
-            return
+    def onCommand(self, Unit, Command, Level, Hue):
+        Domoticz.Debug(
+            "onCommand called for Unit "
+            + str(Unit)
+            + ": Parameter '"
+            + str(Command)
+            + "', Level: "
+            + str(Level)
+        )
+
+        # in case of 'on' and 'off', the dimmable endpoint doesn't seem to respect the switch status
+        if "on" == Command.lower():
+            url = "/zeroconf/switch"
+            data = {"switch": "on"}
+            n_value = 1
+        elif "off" == Command.lower():
+            url = "/zeroconf/switch"
+            data = {"switch": "off"}
+            n_value = 0
+        else:
+            url = "/zeroconf/dimmable"
+            if Level > 0:
+                switch = "on"
+                n_value = 1
+            else:
+                switch = "off"
+                n_value = 0
+            data = {"switch": switch, "brightness": Level}
+        self.httpConn.Send(
+            {
+                "Verb": "POST",
+                "URL": url,
+                "Headers": {"Content-Type": "application/json"},
+                "Data": json.dumps({"deviceid": "", "data": data}),
+            }
+        )
+        self.query_status(self.httpConn)
+
+    def onDisconnect(self, Connection):
+        Domoticz.Log(
+            "onDisconnect called for connection to: "
+            + Connection.Address
+            + ":"
+            + Connection.Port
+        )
+
+    def onHeartbeat(self):
+        try:
+            if self.httpConn and self.httpConn.Connected():
+                self.oustandingPings = self.oustandingPings + 1
+                if self.oustandingPings > 6:
+                    Domoticz.Log(
+                        "Too many outstanding connection issues forcing disconnect."
+                    )
+                    self.httpConn.Disconnect()
+                    self.nextConnect = 0
+                else:
+                    self.query_status(self.httpConn)
+            elif self.httpConn:
+                # if not connected try and reconnected every 3 heartbeats
+                self.oustandingPings = 0
+                self.nextConnect = self.nextConnect - 1
+                if self.nextConnect <= 0:
+                    self.nextConnect = 3
+                    self.httpConn.Connect()
+            else:
+                self.onStart()
+            return True
+        except:
+            Domoticz.Log(
+                "Unhandled exception in onHeartbeat; resetting"
+            )
+            self.httpConn = None
+            self.onStart()
+
+    def update_device(self, data):
         # create new devices if the don't exist just yet
         existing_devices = [d.DeviceID for d in Devices.values()]
         if data["deviceid"] not in existing_devices:
@@ -131,78 +193,25 @@ class BasePlugin:
             else:
                 n_value = 0
             s_value = str(data["brightness"])
-
+            # SignalLevel: see https://stackoverflow.com/a/31852591
             device.Update(
                 nValue=n_value,
                 sValue=s_value,
-                SignalLevel=int((1 / (-1 * data["signalStrength"])) * 100),
+                SignalLevel=min(
+                    max(2 * (data["signalStrength"] + 100), 0), 100
+                ),
                 BatteryLevel=100,
             )
 
-    def onCommand(self, Unit, Command, Level, Hue):
-        Domoticz.Debug(
-            "onCommand called for Unit "
-            + str(Unit)
-            + ": Parameter '"
-            + str(Command)
-            + "', Level: "
-            + str(Level)
-        )
-
-        # in case of 'on' and 'off', the dimmable endpoint doesn't seem to respect the switch status
-        if Command.lower() in ["off", "on"]:
-            url = "/zeroconf/switch"
-            data = {"switch": Command.lower()}
-        else:
-            url = "/zeroconf/dimmable"
-            if Level > 0:
-                switch = "on"
-            else:
-                switch = "off"
-            data = {"switch": switch, "brightness": Level}
-        self.httpConn.Send(
+    def query_status(self, Connection):
+        Connection.Send(
             {
                 "Verb": "POST",
-                "URL": url,
+                "URL": "/zeroconf/info",
                 "Headers": {"Content-Type": "application/json"},
-                "Data": json.dumps({"deviceid": "", "data": data}),
+                "Data": json.dumps({"data": ""}),
             }
         )
-
-    def onDisconnect(self, Connection):
-        Domoticz.Log(
-            "onDisconnect called for connection to: "
-            + Connection.Address
-            + ":"
-            + Connection.Port
-        )
-
-    def onHeartbeat(self):
-        try:
-            if self.httpConn and self.httpConn.Connected():
-                self.oustandingPings = self.oustandingPings + 1
-                if self.oustandingPings > 6:
-                    Domoticz.Log(
-                        "Too many outstanding connection issues forcing disconnect."
-                    )
-                    self.httpConn.Disconnect()
-                    self.nextConnect = 0
-                else:
-                    self.query_status(self.httpConn)
-            else:
-                # if not connected try and reconnected every 3 heartbeats
-                self.oustandingPings = 0
-                self.nextConnect = self.nextConnect - 1
-                if self.nextConnect <= 0:
-                    self.nextConnect = 3
-                    self.httpConn.Connect()
-            return True
-        except:
-            Domoticz.Log(
-                "Unhandled exception in onHeartbeat, forcing disconnect."
-            )
-            self.onDisconnect(self.httpConn)
-            self.httpConn = None
 
 global _plugin
 _plugin = BasePlugin()
@@ -239,7 +248,6 @@ def onNotification(Name, Subject, Text, Status, Priority, Sound, ImageFile):
         Name, Subject, Text, Status, Priority, Sound, ImageFile
     )
 
-
 def onDisconnect(Connection):
     global _plugin
     _plugin.onDisconnect(Connection)
@@ -251,48 +259,48 @@ def onHeartbeat():
 
 
 # Generic helper functions
-def LogMessage(Message):
-    if Parameters["Mode6"] == "File":
-        f = open(Parameters["HomeFolder"] + "http.html", "w")
-        f.write(Message)
-        f.close()
-        Domoticz.Log("File written")
+# def LogMessage(Message):
+    # if Parameters["Mode6"] == "File":
+        # f = open(Parameters["HomeFolder"] + "http.html", "w")
+        # f.write(Message)
+        # f.close()
+        # Domoticz.Log("File written")
 
 
-def DumpConfigToLog():
-    for x in Parameters:
-        if Parameters[x] != "":
-            Domoticz.Debug("'" + x + "':'" + str(Parameters[x]) + "'")
-    Domoticz.Debug("Device count: " + str(len(Devices)))
-    for x in Devices:
-        Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
-        Domoticz.Debug("Device ID:       '" + str(Devices[x].ID) + "'")
-        Domoticz.Debug("Device Name:     '" + Devices[x].Name + "'")
-        Domoticz.Debug("Device nValue:    " + str(Devices[x].nValue))
-        Domoticz.Debug("Device sValue:   '" + Devices[x].sValue + "'")
-        Domoticz.Debug("Device LastLevel: " + str(Devices[x].LastLevel))
-    return
+# def DumpConfigToLog():
+    # for x in Parameters:
+        # if Parameters[x] != "":
+            # Domoticz.Debug("'" + x + "':'" + str(Parameters[x]) + "'")
+    # Domoticz.Debug("Device count: " + str(len(Devices)))
+    # for x in Devices:
+        # Domoticz.Debug("Device:           " + str(x) + " - " + str(Devices[x]))
+        # Domoticz.Debug("Device ID:       '" + str(Devices[x].ID) + "'")
+        # Domoticz.Debug("Device Name:     '" + Devices[x].Name + "'")
+        # Domoticz.Debug("Device nValue:    " + str(Devices[x].nValue))
+        # Domoticz.Debug("Device sValue:   '" + Devices[x].sValue + "'")
+        # Domoticz.Debug("Device LastLevel: " + str(Devices[x].LastLevel))
+    # return
 
 
-def DumpHTTPResponseToLog(httpResp, level=0):
-    if level == 0:
-        Domoticz.Debug("HTTP Details (" + str(len(httpResp)) + "):")
-    indentStr = ""
-    for x in range(level):
-        indentStr += "----"
-    if isinstance(httpResp, dict):
-        for x in httpResp:
-            if not isinstance(httpResp[x], dict) and not isinstance(
-                httpResp[x], list
-            ):
-                Domoticz.Debug(
-                    indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'"
-                )
-            else:
-                Domoticz.Debug(indentStr + ">'" + x + "':")
-                DumpHTTPResponseToLog(httpResp[x], level + 1)
-    elif isinstance(httpResp, list):
-        for x in httpResp:
-            Domoticz.Debug(indentStr + "['" + x + "']")
-    else:
-        Domoticz.Debug(indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
+# def DumpHTTPResponseToLog(httpResp, level=0):
+    # if level == 0:
+        # Domoticz.Debug("HTTP Details (" + str(len(httpResp)) + "):")
+    # indentStr = ""
+    # for x in range(level):
+        # indentStr += "----"
+    # if isinstance(httpResp, dict):
+        # for x in httpResp:
+            # if not isinstance(httpResp[x], dict) and not isinstance(
+                # httpResp[x], list
+            # ):
+                # Domoticz.Debug(
+                    # indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'"
+                # )
+            # else:
+                # Domoticz.Debug(indentStr + ">'" + x + "':")
+                # DumpHTTPResponseToLog(httpResp[x], level + 1)
+    # elif isinstance(httpResp, list):
+        # for x in httpResp:
+            # Domoticz.Debug(indentStr + "['" + x + "']")
+    # else:
+        # Domoticz.Debug(indentStr + ">'" + x + "':'" + str(httpResp[x]) + "'")
